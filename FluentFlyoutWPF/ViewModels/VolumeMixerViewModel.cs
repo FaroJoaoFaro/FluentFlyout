@@ -10,6 +10,7 @@ using NAudio.CoreAudioApi;
 using NAudio.CoreAudioApi.Interfaces;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Windows.Threading;
 
 namespace FluentFlyoutWPF.ViewModels;
@@ -23,6 +24,7 @@ public partial class VolumeMixerViewModel : ObservableObject, IDisposable
 
     private MMDevice? _device;
     private DispatcherTimer? _pollTimer;
+    private bool _isDeviceLost;
 
     [ObservableProperty]
     public partial float MasterVolume { get; set; }
@@ -108,7 +110,14 @@ public partial class VolumeMixerViewModel : ObservableObject, IDisposable
     partial void OnMasterVolumeChanged(float value)
     {
         if (_device == null) return;
-        _device.AudioEndpointVolume.MasterVolumeLevelScalar = Math.Clamp(value, 0f, 1f);
+        try
+        {
+            _device.AudioEndpointVolume.MasterVolumeLevelScalar = Math.Clamp(value, 0f, 1f);
+        }
+        catch (COMException ex)
+        {
+            MarkDeviceLost(ex);
+        }
         if (MasterVolume == 0f)
         {
             IsMasterMuted = true;
@@ -122,7 +131,14 @@ public partial class VolumeMixerViewModel : ObservableObject, IDisposable
     partial void OnIsMasterMutedChanged(bool value)
     {
         if (_device == null) return;
-        _device.AudioEndpointVolume.Mute = value;
+        try
+        {
+            _device.AudioEndpointVolume.Mute = value;
+        }
+        catch (COMException ex)
+        {
+            MarkDeviceLost(ex);
+        }
     }
 
     public bool TryAdjustMasterVolume(float delta)
@@ -145,8 +161,16 @@ public partial class VolumeMixerViewModel : ObservableObject, IDisposable
 
         if (session == null) return false;
 
-        session.AdjustVolume(delta);
-        return true;
+        try
+        {
+            session.AdjustVolume(delta);
+            return true;
+        }
+        catch (COMException ex)
+        {
+            MarkDeviceLost(ex);
+            return false;
+        }
     }
 
 
@@ -154,8 +178,18 @@ public partial class VolumeMixerViewModel : ObservableObject, IDisposable
     {
         if (_device == null) return;
 
-        var vol = _device.AudioEndpointVolume.MasterVolumeLevelScalar;
-        var mute = _device.AudioEndpointVolume.Mute;
+        float vol;
+        bool mute;
+        try
+        {
+            vol = _device.AudioEndpointVolume.MasterVolumeLevelScalar;
+            mute = _device.AudioEndpointVolume.Mute;
+        }
+        catch (COMException ex)
+        {
+            MarkDeviceLost(ex);
+            return;
+        }
 
         if (MathF.Abs(MasterVolume - vol) > 0.001f)
             MasterVolume = vol;
@@ -240,15 +274,56 @@ public partial class VolumeMixerViewModel : ObservableObject, IDisposable
     }
 
 
+    // device and session references stop working when the Windows Audio service restarts
+    private void MarkDeviceLost(COMException ex)
+    {
+        if (_isDeviceLost) return;
+
+        _isDeviceLost = true;
+        Logger.Warn(ex, "Lost connection to audio device, reattaching volume mixer");
+    }
+
+    private void TryReattachDevice()
+    {
+        var device = AudioDeviceMonitor.Instance.GetDefaultRenderDevice();
+        if (device == null) return;
+
+        try
+        {
+            _ = device.AudioEndpointVolume.MasterVolumeLevelScalar;
+        }
+        catch (COMException)
+        {
+            return;
+        }
+
+        _isDeviceLost = false;
+        AttachDevice(device);
+        Logger.Info("Reattached volume mixer to audio device");
+    }
+
     public void OnPollTick(object? sender, EventArgs e)
     {
+        if (_isDeviceLost)
+        {
+            TryReattachDevice();
+            return;
+        }
+
         SyncMasterFromDevice();
 
-        foreach (var session in Sessions)
+        try
         {
-            session.SyncFromDevice();
-            //Logger.Trace("Session '{0}' (PID {1}) - Volume: {2}, Muted: {3}, State: {4}",
-            //    session.DisplayName, session.ProcessId, session.Volume, session.IsMuted, session.State);
+            foreach (var session in Sessions)
+            {
+                session.SyncFromDevice();
+                //Logger.Trace("Session '{0}' (PID {1}) - Volume: {2}, Muted: {3}, State: {4}",
+                //    session.DisplayName, session.ProcessId, session.Volume, session.IsMuted, session.State);
+            }
+        }
+        catch (COMException ex)
+        {
+            MarkDeviceLost(ex);
         }
     }
 
